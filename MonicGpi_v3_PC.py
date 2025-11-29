@@ -105,8 +105,8 @@ class DetectorAnomalias:
 # ==========================================
 # 🧠 ANÁLISIS DE RIESGO MEJORADO
 # ==========================================
-def analizar_riesgo_avanzado(temp, gas, hum, prediccion_ia):
-    """Análisis de riesgo combinando reglas + IA"""
+def analizar_riesgo_avanzado(temp, gas, hum, distancia, prediccion_ia):
+    """Análisis de riesgo combinando reglas + IA + proximidad"""
     score = 0
     factores = []
     
@@ -137,13 +137,19 @@ def analizar_riesgo_avanzado(temp, gas, hum, prediccion_ia):
         score += 20
         factores.append("🤖 IA detectó anomalía")
     
+    # Detección de proximidad
+    mensaje_extra = ""
+    if distancia > 0 and distancia < 10:
+        factores.append("🚶 Movimiento detectado < 10cm")
+        mensaje_extra = " | 🚶 MOVIMIENTO DETECTADO"
+    
     # Determinar nivel de alerta
     if score >= 60:
         return {
             "nivel": "CRÍTICO",
             "color": "inverse",
             "icono": "🔥",
-            "mensaje": "¡ALERTA DE INCENDIO!",
+            "mensaje": f"¡ALERTA DE INCENDIO!{mensaje_extra}",
             "score": score,
             "factores": factores
         }
@@ -152,7 +158,7 @@ def analizar_riesgo_avanzado(temp, gas, hum, prediccion_ia):
             "nivel": "ADVERTENCIA",
             "color": "off",
             "icono": "⚠️",
-            "mensaje": "Condiciones Peligrosas",
+            "mensaje": f"Condiciones Peligrosas{mensaje_extra}",
             "score": score,
             "factores": factores
         }
@@ -161,7 +167,7 @@ def analizar_riesgo_avanzado(temp, gas, hum, prediccion_ia):
             "nivel": "NORMAL",
             "color": "normal",
             "icono": "✅",
-            "mensaje": "Sistema Estable",
+            "mensaje": f"Sistema Estable{mensaje_extra}",
             "score": score,
             "factores": factores
         }
@@ -233,6 +239,7 @@ with st.sidebar:
     st.markdown("✓ Promedio móvil (3 muestras)")
     st.markdown("✓ Filtro de ruido")
     st.markdown("✓ Detección de anomalías")
+    st.markdown("✓ Detección de proximidad")
 
 st.markdown("---")
 
@@ -243,13 +250,14 @@ info_dispositivo = col_dispositivo.empty()
 
 st.markdown("---")
 
-# KPIs principales
+# KPIs principales (AHORA SON 5 COLUMNAS)
 st.markdown("### 📊 Métricas en Tiempo Real")
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 kpi_temp = col1.empty()
 kpi_hum = col2.empty()
 kpi_gas = col3.empty()
-kpi_riesgo = col4.empty()
+kpi_dist = col4.empty()  # Nueva columna para el Ultrasonido
+kpi_riesgo = col5.empty()
 
 # Banner de alertas
 st.markdown("### 📢 Estado del Sistema")
@@ -285,6 +293,7 @@ def obtener_recursos():
         "historial_temp": deque(maxlen=100),
         "historial_hum": deque(maxlen=100),
         "historial_gas": deque(maxlen=100),
+        "historial_dist": deque(maxlen=100),
         "timestamps": deque(maxlen=100)
     }
     
@@ -300,10 +309,12 @@ def obtener_recursos():
             t = payload.get('temp', 0)
             h = payload.get('hum', 0)
             g = payload.get('gas', 0)
+            d = payload.get('distancia', 0)
             
             memoria["historial_temp"].append(t)
             memoria["historial_hum"].append(h)
             memoria["historial_gas"].append(g)
+            memoria["historial_dist"].append(d)
             memoria["timestamps"].append(datetime.now())
             
             # Alimentar modelo IA
@@ -346,6 +357,7 @@ while True:
         t = data.get('temp', 0)
         h = data.get('hum', 0)
         g = data.get('gas', 0)
+        d = data.get('distancia', 0)  # Leer distancia del sensor ultrasonido
         hw = data.get('hardware', {})
         sensores = data.get('estado_sensores', {})
         filtro_info = data.get('filtro', {})
@@ -354,8 +366,8 @@ while True:
         # Predicción IA
         prediccion = detector_ia.predecir(t, h, g)
         
-        # Análisis de riesgo combinado
-        riesgo = analizar_riesgo_avanzado(t, g, h, prediccion)
+        # Análisis de riesgo combinado (incluye distancia)
+        riesgo = analizar_riesgo_avanzado(t, g, h, d, prediccion)
 
         # Estado conexión
         estado_rpi.success(f"🟢 **ONLINE** | Última lectura: hace {int(segundos_atras)}s")
@@ -367,7 +379,7 @@ while True:
             c2.markdown(f"**🌡️ CPU:** {hw.get('cpu_temp', 'N/A')}°C")
             c3.markdown(f"**🐍 Python:** {hw.get('python_version', 'N/A')}")
 
-        # KPIs
+        # KPIs (5 columnas)
         kpi_temp.metric(
             "🌡️ Temperatura",
             f"{t} °C",
@@ -384,6 +396,12 @@ while True:
             f"{g} ppm",
             f"Raw: {datos_raw.get('gas', g)} ppm",
             delta_color="inverse" if g > 150 else "normal"
+        )
+        kpi_dist.metric(
+            "📏 Proximidad",
+            f"{d} cm",
+            f"HC-SR04",
+            delta_color="inverse" if d > 0 and d < 10 else "normal"
         )
         kpi_riesgo.metric(
             "⚡ Riesgo",
@@ -417,19 +435,21 @@ while True:
             st.markdown(f"- **Host:** {hw.get('hostname', 'N/A')}")
             st.markdown(f"- **Filtro:** Promedio de {filtro_info.get('ventana', 3)} muestras")
 
-        # Tabla de sensores
+        # Tabla de sensores (actualizada para incluir ultrasonido)
         with tabla_sensores.container():
             st.markdown("**📡 Estado de Sensores**")
             df = pd.DataFrame({
-                "Sensor": ["DHT11", "MQ-135", "LM35"],
-                "Tipo": ["Temp/Hum", "Gas", "Temp Precisión"],
+                "Sensor": ["DHT11", "HC-SR04", "MQ-135", "LM35"],
+                "Tipo": ["Temp/Hum", "Distancia", "Gas", "Temp Precisión"],
                 "Modelo": [
                     hw.get('modelo_temp_hum', 'N/A'),
+                    hw.get('modelo_distancia', 'N/A'),
                     hw.get('modelo_gas', 'N/A'),
                     hw.get('modelo_temp_precision', 'N/A')
                 ],
                 "Estado": [
                     sensores.get('dht11', 'N/A'),
+                    sensores.get('ultrasonido', 'N/A'),
                     sensores.get('mq135', 'N/A'),
                     sensores.get('lm35', 'N/A')
                 ]
@@ -456,13 +476,14 @@ while True:
             else:
                 st.markdown("- Ninguno detectado ✓")
 
-        # Gráfico historial
+        # Gráfico historial (ahora incluye distancia)
         with grafico_historial.container():
             if len(memoria["historial_temp"]) > 5:
                 df_hist = pd.DataFrame({
                     "Temperatura": list(memoria["historial_temp"]),
                     "Humedad": list(memoria["historial_hum"]),
-                    "Gas": list(memoria["historial_gas"])
+                    "Gas": list(memoria["historial_gas"]),
+                    "Distancia": list(memoria["historial_dist"])
                 })
                 st.line_chart(df_hist, height=200)
 
@@ -474,6 +495,7 @@ while True:
         kpi_temp.metric("🌡️ Temperatura", "--", "Sin señal")
         kpi_hum.metric("💧 Humedad", "--", "Sin señal")
         kpi_gas.metric("💨 Calidad Aire", "--", "Sin señal")
+        kpi_dist.metric("📏 Proximidad", "--", "Sin señal")
         kpi_riesgo.metric("⚡ Riesgo", "--", "Sin datos")
         
         alert_banner.error("## 🔌 SISTEMA DESCONECTADO")
