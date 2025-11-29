@@ -1,490 +1,461 @@
 # -*- coding: utf-8 -*-
 """
-🌲 DASHBOARD FORESTAL CON IA
-Monitor Central de Incendios con Machine Learning
+🌲 MONITOR FORESTAL - RASPBERRY PI 3
+Sistema de detección temprana de incendios con sensor ultrasónico
 """
-import streamlit as st
 import paho.mqtt.client as mqtt
+import adafruit_dht
+import board
 import json
 import time
-import pandas as pd
-import numpy as np
 import ssl
-from datetime import datetime
+import random
+import platform
+import os
+import RPi.GPIO as GPIO
 from collections import deque
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
-import warnings
-warnings.filterwarnings('ignore')
+from datetime import datetime
 
 # ==========================================
-# ⚙️ CONFIGURACIÓN
+# ⚙️ CONFIGURACIÓN MQTT
 # ==========================================
 BROKER = "6071f9f543bb41f297470c8742588c93.s1.eu.hivemq.cloud"
 PORT = 8883
 USER = "jore746"
 PASS = "Wildbl00d$746"
 TOPIC = "bosque/sensores"
-TIEMPO_LIMITE_DESCONEXION = 6
 
 # ==========================================
-# 🤖 MODELO DE IA - DETECCIÓN DE ANOMALÍAS
+# 🔧 CONFIGURACIÓN DE SENSORES
 # ==========================================
-class DetectorAnomalias:
-    """Detector de anomalías usando Isolation Forest"""
-    def __init__(self, ventana_entrenamiento=50):
-        self.modelo = IsolationForest(
-            contamination=0.1,
-            random_state=42,
-            n_estimators=100
-        )
-        self.scaler = StandardScaler()
-        self.historial = deque(maxlen=ventana_entrenamiento)
-        self.entrenado = False
-        self.min_muestras = 20
-    
-    def agregar_muestra(self, temp, hum, gas):
-        """Agrega una muestra al historial"""
-        self.historial.append([temp, hum, gas])
-        
-        # Entrenar cuando tengamos suficientes datos
-        if len(self.historial) >= self.min_muestras and not self.entrenado:
-            self._entrenar()
-    
-    def _entrenar(self):
-        """Entrena el modelo con los datos acumulados"""
-        datos = np.array(self.historial)
-        datos_escalados = self.scaler.fit_transform(datos)
-        self.modelo.fit(datos_escalados)
-        self.entrenado = True
-    
-    def predecir(self, temp, hum, gas):
-        """Predice si los datos son anómalos"""
-        if not self.entrenado:
-            return {
-                "es_anomalia": False,
-                "confianza": 0,
-                "estado": "ENTRENANDO",
-                "mensaje": f"Recolectando datos ({len(self.historial)}/{self.min_muestras})"
-            }
-        
-        muestra = np.array([[temp, hum, gas]])
-        muestra_escalada = self.scaler.transform(muestra)
-        
-        prediccion = self.modelo.predict(muestra_escalada)[0]
-        score = self.modelo.decision_function(muestra_escalada)[0]
-        
-        # Convertir score a probabilidad (aproximación)
-        confianza = min(100, max(0, int((1 - score) * 50 + 50)))
-        
-        es_anomalia = prediccion == -1
-        
-        return {
-            "es_anomalia": es_anomalia,
-            "confianza": confianza,
-            "score": round(score, 3),
-            "estado": "ALERTA" if es_anomalia else "NORMAL",
-            "mensaje": "⚠️ Patrón inusual detectado" if es_anomalia else "✅ Valores normales"
-        }
-    
-    def get_estadisticas(self):
-        """Retorna estadísticas del modelo"""
-        if len(self.historial) == 0:
-            return None
-        datos = np.array(self.historial)
-        return {
-            "muestras": len(self.historial),
-            "temp_media": round(np.mean(datos[:, 0]), 1),
-            "temp_std": round(np.std(datos[:, 0]), 2),
-            "hum_media": round(np.mean(datos[:, 1]), 1),
-            "hum_std": round(np.std(datos[:, 1]), 2),
-            "gas_media": round(np.mean(datos[:, 2]), 1),
-            "gas_std": round(np.std(datos[:, 2]), 2),
-        }
+PIN_DHT11 = board.D27
+TRIG = 14               # Ultrasonido (Disparo) - Pin Físico 8
+ECHO = 15               # Ultrasonido (Escucha) - Pin Físico 10
+
+USAR_DHT11 = True
+USAR_ULTRASONIDO = True
+USAR_MQ135 = False      # Cambiar a True cuando conectes
+USAR_LM35 = False       # Cambiar a True cuando conectes
 
 # ==========================================
-# 🧠 ANÁLISIS DE RIESGO MEJORADO
+# 📊 CLASE DE PRE-PROCESAMIENTO
 # ==========================================
-def analizar_riesgo_avanzado(temp, gas, hum, prediccion_ia):
-    """Análisis de riesgo combinando reglas + IA"""
-    score = 0
-    factores = []
+class FiltroDatos:
+    """
+    Filtro Híbrido Inteligente:
+    - Temperatura/Humedad/Gas: Promedio móvil (3 muestras) para estabilidad
+    - Distancia: Pasa DIRECTO (Raw) para detección instantánea de movimiento
+    """
+    def __init__(self):
+        # Sensores lentos: Ventana de 3 para filtrar ruido
+        self.historial_temp = deque(maxlen=3)
+        self.historial_hum = deque(maxlen=3)
+        self.historial_gas = deque(maxlen=3)
+        # Ultrasonido: Sin historial, pasa directo
+
+        # 2. Variable para Ultrasonido (Anti-Rebote)
+        self.ultima_distancia_valida = 0
+        self.MAX_RANGO_REAL = 400 # Límite físico del sensor (4 metros)
     
-    # Reglas basadas en umbrales
-    if temp > 45:
-        score += 40
-        factores.append("🔥 Temperatura crítica")
-    elif temp > 35:
-        score += 20
-        factores.append("⚠️ Temperatura elevada")
+    def procesar(self, temp, hum, gas, distancia_raw):
+        """
+        Procesa los datos aplicando filtrado selectivo
+        Returns: dict con valores procesados
+        """
+        resultado = {"temp": None, "hum": None, "gas": None, "distancia": None}
+        
+        # --- FILTRADO CON PROMEDIO (Señales lentas) ---
+        if temp is not None:
+            self.historial_temp.append(temp)
+            resultado["temp"] = round(sum(self.historial_temp) / len(self.historial_temp), 1)
+        
+        if hum is not None:
+            self.historial_hum.append(hum)
+            resultado["hum"] = round(sum(self.historial_hum) / len(self.historial_hum), 1)
+        
+        if gas is not None:
+            self.historial_gas.append(gas)
+            resultado["gas"] = round(sum(self.historial_gas) / len(self.historial_gas), 1)
+        
+        if distancia_raw is not None:
+            if distancia_raw > self.MAX_RANGO_REAL:
+                # ¡CASO ERROR 840cm! -> Ignoramos y mantenemos el anterior
+                resultado["distancia"] = self.ultima_distancia_valida
+            else:
+                # CASO REAL -> Actualizamos memoria y enviamos
+                self.ultima_distancia_valida = distancia_raw
+                resultado["distancia"] = distancia_raw
+        else:
+            # Si el sensor no leyó nada, mantenemos el último conocido
+            resultado["distancia"] = self.ultima_distancia_valida
+        
+        return resultado
     
-    if gas > 300:
-        score += 35
-        factores.append("💨 Nivel de gas peligroso")
-    elif gas > 150:
-        score += 15
-        factores.append("💨 Gas elevado")
-    
-    if hum < 20:
-        score += 15
-        factores.append("💧 Humedad muy baja")
-    elif hum < 35:
-        score += 5
-        factores.append("💧 Humedad baja")
-    
-    # Bonus por detección de IA
-    if prediccion_ia["es_anomalia"]:
-        score += 20
-        factores.append("🤖 IA detectó anomalía")
-    
-    # Determinar nivel de alerta
-    if score >= 60:
+    def get_estado(self):
+        """Retorna configuración actual del filtro"""
         return {
-            "nivel": "CRÍTICO",
-            "color": "inverse",
-            "icono": "🔥",
-            "mensaje": "¡ALERTA DE INCENDIO!",
-            "score": score,
-            "factores": factores
-        }
-    elif score >= 30:
-        return {
-            "nivel": "ADVERTENCIA",
-            "color": "off",
-            "icono": "⚠️",
-            "mensaje": "Condiciones Peligrosas",
-            "score": score,
-            "factores": factores
-        }
-    else:
-        return {
-            "nivel": "NORMAL",
-            "color": "normal",
-            "icono": "✅",
-            "mensaje": "Sistema Estable",
-            "score": score,
-            "factores": factores
+            "muestras_temp": len(self.historial_temp),
+            "muestras_hum": len(self.historial_hum),
+            "muestras_gas": len(self.historial_gas),
+            "ventana_promedio": 3,
+            "modo_distancia": f"Anti-Pico > {self.MAX_RANGO_REAL}cm"
         }
 
 # ==========================================
-# 🖥️ CONFIGURACIÓN DE PÁGINA
+# 🖥️ DETECCIÓN DE HARDWARE
 # ==========================================
-st.set_page_config(
-    page_title="🌲 Monitor Forestal IA",
-    page_icon="🌲",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# CSS Personalizado
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: 700;
-        background: linear-gradient(90deg, #1e5631 0%, #2e7d32 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        padding: 1rem 0;
-    }
-    .status-card {
-        padding: 1rem;
-        border-radius: 10px;
-        margin: 0.5rem 0;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1.5rem;
-        border-radius: 15px;
-        color: white;
-        text-align: center;
-    }
-    .sensor-online { color: #4caf50; font-weight: bold; }
-    .sensor-offline { color: #f44336; font-weight: bold; }
-    .ia-badge {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 0.3rem 0.8rem;
-        border-radius: 20px;
-        font-size: 0.85rem;
-    }
-    div[data-testid="stMetricValue"] { font-size: 2rem; }
-</style>
-""", unsafe_allow_html=True)
-
-# ==========================================
-# 🎨 INTERFAZ
-# ==========================================
-st.markdown('<h1 class="main-header">🌲 Monitor Central de Incendios</h1>', unsafe_allow_html=True)
-st.markdown('<p style="text-align:center; color:#666;">Sistema de Detección con Inteligencia Artificial</p>', unsafe_allow_html=True)
-
-# Sidebar
-with st.sidebar:
-    st.markdown("### ⚙️ Configuración")
-    st.markdown(f"**Broker:** `{BROKER[:20]}...`")
-    st.markdown(f"**Topic:** `{TOPIC}`")
-    st.markdown("---")
-    st.markdown("### 🤖 Modelo IA")
-    st.markdown("**Algoritmo:** Isolation Forest")
-    st.markdown("**Propósito:** Detectar patrones anómalos en sensores")
-    st.markdown("---")
-    st.markdown("### 📊 Pre-procesamiento")
-    st.markdown("✓ Promedio móvil (3 muestras)")
-    st.markdown("✓ Filtro de ruido")
-    st.markdown("✓ Detección de anomalías")
-
-st.markdown("---")
-
-# Contenedores principales
-col_estado, col_dispositivo = st.columns([1, 2])
-estado_rpi = col_estado.empty()
-info_dispositivo = col_dispositivo.empty()
-
-st.markdown("---")
-
-# KPIs principales
-st.markdown("### 📊 Métricas en Tiempo Real")
-col1, col2, col3, col4 = st.columns(4)
-kpi_temp = col1.empty()
-kpi_hum = col2.empty()
-kpi_gas = col3.empty()
-kpi_riesgo = col4.empty()
-
-# Banner de alertas
-st.markdown("### 📢 Estado del Sistema")
-col_alert, col_ia = st.columns([2, 1])
-alert_banner = col_alert.empty()
-ia_status = col_ia.empty()
-
-st.markdown("---")
-
-# Sección de Hardware y Sensores
-st.markdown("### 🛠️ Hardware y Sensores")
-col_hw, col_sens, col_stats = st.columns(3)
-
-info_hardware = col_hw.empty()
-tabla_sensores = col_sens.empty()
-stats_ia = col_stats.empty()
-
-# Historial de datos
-st.markdown("---")
-st.markdown("### 📈 Análisis de IA")
-col_factores, col_historial = st.columns([1, 2])
-factores_riesgo = col_factores.empty()
-grafico_historial = col_historial.empty()
-
-# ==========================================
-# 🔌 CONEXIÓN MQTT
-# ==========================================
-@st.cache_resource
-def obtener_recursos():
-    memoria = {
-        "ultimo_dato": None,
-        "ultima_recepcion": 0,
-        "historial_temp": deque(maxlen=100),
-        "historial_hum": deque(maxlen=100),
-        "historial_gas": deque(maxlen=100),
-        "timestamps": deque(maxlen=100)
-    }
+def obtener_info_raspberry():
+    """Detecta automáticamente el modelo de Raspberry Pi y obtiene info del sistema"""
+    modelo = "Raspberry Pi (Desconocido)"
+    try:
+        with open('/proc/device-tree/model', 'r') as f:
+            modelo = f.read().strip('\x00').strip()
+    except:
+        modelo = platform.machine() + " - " + platform.system()
     
-    detector_ia = DetectorAnomalias(ventana_entrenamiento=50)
+    # Temperatura del CPU
+    cpu_temp = None
+    try:
+        with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+            cpu_temp = round(int(f.read()) / 1000, 1)
+    except:
+        pass
+    
+    return {
+        "modelo_rpi": modelo,
+        "cpu_temp": cpu_temp,
+        "python_version": platform.python_version(),
+        "hostname": platform.node()
+    }
 
-    def on_message(client, userdata, msg):
+# ==========================================
+# 📡 CLASE DE GESTIÓN DE SENSORES
+# ==========================================
+class GestorSensores:
+    """Gestiona la inicialización y lectura de todos los sensores"""
+    
+    def __init__(self):
+        self.dht_sensor = None
+        self.estado = {
+            "dht11": {"conectado": False, "modelo": "DHT11 Digital", "ultimo_error": None},
+            "ultrasonido": {"conectado": False, "modelo": "HC-SR04", "ultimo_error": None},
+            "mq135": {"conectado": False, "modelo": "MQ-135 (Gas/Humo)", "ultimo_error": None},
+            "lm35": {"conectado": False, "modelo": "LM35 Analógico", "ultimo_error": None}
+        }
+        self._inicializar_sensores()
+    
+    def _inicializar_sensores(self):
+        """Inicializa todos los sensores habilitados"""
+        
+        # DHT11 - Temperatura y Humedad
+        if USAR_DHT11:
+            try:
+                self.dht_sensor = adafruit_dht.DHT11(PIN_DHT11)
+                self.estado["dht11"]["conectado"] = True
+                print("✅ DHT11: Inicializado correctamente")
+            except Exception as e:
+                self.estado["dht11"]["ultimo_error"] = str(e)
+                print(f"❌ DHT11: Error - {e}")
+        
+        # HC-SR04 - Sensor Ultrasónico
+        if USAR_ULTRASONIDO:
+            try:
+                GPIO.setwarnings(False)
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setup(TRIG, GPIO.OUT)
+                GPIO.setup(ECHO, GPIO.IN)
+                self.estado["ultrasonido"]["conectado"] = True
+                print("✅ Ultrasonido HC-SR04: Inicializado correctamente")
+            except Exception as e:
+                self.estado["ultrasonido"]["ultimo_error"] = str(e)
+                print(f"❌ Ultrasonido: Error - {e}")
+        
+        # MQ135 - Sensor de Gas (preparado para conexión futura)
+        if USAR_MQ135:
+            self.estado["mq135"]["conectado"] = True
+            print("✅ MQ135: Listo (simulado)")
+        
+        # LM35 - Temperatura de Precisión (preparado para conexión futura)
+        if USAR_LM35:
+            self.estado["lm35"]["conectado"] = True
+            print("✅ LM35: Listo (simulado)")
+    
+    def leer_dht11(self):
+        """Lee temperatura y humedad del DHT11"""
+        if not USAR_DHT11 or self.dht_sensor is None:
+            return None, None
         try:
-            payload = json.loads(msg.payload.decode())
-            memoria["ultimo_dato"] = payload
-            memoria["ultima_recepcion"] = time.time()
-            
-            # Guardar historial
-            t = payload.get('temp', 0)
-            h = payload.get('hum', 0)
-            g = payload.get('gas', 0)
-            
-            memoria["historial_temp"].append(t)
-            memoria["historial_hum"].append(h)
-            memoria["historial_gas"].append(g)
-            memoria["timestamps"].append(datetime.now())
-            
-            # Alimentar modelo IA
-            detector_ia.agregar_muestra(t, h, g)
-        except:
-            pass
+            temp = self.dht_sensor.temperature
+            hum = self.dht_sensor.humidity
+            self.estado["dht11"]["conectado"] = True
+            self.estado["dht11"]["ultimo_error"] = None
+            return temp, hum
+        except RuntimeError as e:
+            self.estado["dht11"]["ultimo_error"] = str(e)
+            return None, None
+    
+    def leer_ultrasonido(self):
+        """
+        Lee distancia del sensor HC-SR04
+        Retorna: distancia en cm (0 si hay error)
+        """
+        if not USAR_ULTRASONIDO:
+            return 0
+        try:
+            # Enviar pulso de disparo
+            GPIO.output(TRIG, False)
+            time.sleep(0.05)  # Pausa para estabilizar
+            GPIO.output(TRIG, True)
+            time.sleep(0.00001)  # Pulso de 10 microsegundos
+            GPIO.output(TRIG, False)
 
-    client_id = f"Dashboard_{datetime.now().strftime('%S%f')}"
+            timeout = time.time()
+            inicio = time.time()
+            fin = time.time()
+
+            # Esperar inicio de señal de retorno (Echo sube a HIGH)
+            while GPIO.input(ECHO) == 0:
+                inicio = time.time()
+                if inicio - timeout > 0.1:  # Timeout de 100ms
+                    return 0
+
+            # Esperar fin de señal de retorno (Echo baja a LOW)
+            while GPIO.input(ECHO) == 1:
+                fin = time.time()
+                if fin - inicio > 0.1:  # Timeout de 100ms
+                    return 0
+
+            # Calcular distancia: Tiempo * Velocidad del sonido / 2
+            # Velocidad del sonido = 343 m/s = 34300 cm/s
+            # Factor: 34300 / 2 = 17150 cm/s
+            distancia = (fin - inicio) * 17150
+            self.estado["ultrasonido"]["conectado"] = True
+            self.estado["ultrasonido"]["ultimo_error"] = None
+            return round(distancia, 2)
+        except Exception as e:
+            self.estado["ultrasonido"]["ultimo_error"] = str(e)
+            return 0
+    
+    def leer_mq135(self):
+        """Lee nivel de gas del MQ135 (simulado por ahora)"""
+        if not USAR_MQ135:
+            return 0
+        # TODO: Implementar lectura real con ADC (MCP3008)
+        return random.randint(10, 50)
+    
+    def leer_lm35(self):
+        """Lee temperatura de precisión del LM35 (simulado por ahora)"""
+        if not USAR_LM35:
+            return None
+        # TODO: Implementar lectura real con ADC (MCP3008)
+        return round(random.uniform(20.0, 25.0), 1)
+    
+    def obtener_estado_sensores(self):
+        """Retorna el estado ONLINE/OFFLINE de todos los sensores"""
+        return {
+            "dht11": "ONLINE" if self.estado["dht11"]["conectado"] else "OFFLINE",
+            "ultrasonido": "ONLINE" if self.estado["ultrasonido"]["conectado"] else "OFFLINE",
+            "mq135": "ONLINE" if self.estado["mq135"]["conectado"] else "OFFLINE",
+            "lm35": "ONLINE" if self.estado["lm35"]["conectado"] else "OFFLINE"
+        }
+    
+    def obtener_modelos(self):
+        """Retorna los modelos de sensores configurados"""
+        return {
+            "modelo_temp_hum": self.estado["dht11"]["modelo"],
+            "modelo_distancia": self.estado["ultrasonido"]["modelo"],
+            "modelo_gas": self.estado["mq135"]["modelo"],
+            "modelo_temp_precision": self.estado["lm35"]["modelo"]
+        }
+    
+    def cleanup(self):
+        """Libera recursos de los sensores"""
+        if self.dht_sensor:
+            try:
+                self.dht_sensor.exit()
+            except:
+                pass
+        if USAR_ULTRASONIDO:
+            try:
+                GPIO.cleanup()
+            except:
+                pass
+
+# ==========================================
+# 🖨️ FUNCIONES DE CONSOLA
+# ==========================================
+def imprimir_banner():
+    """Muestra banner inicial del sistema"""
+    print("\n" + "="*60)
+    print("🌲 MONITOR FORESTAL - RASPBERRY PI 3")
+    print("   Sistema de Detección de Incendios con Ultrasonido")
+    print("="*60)
+
+def imprimir_datos(datos_raw, datos_filtrados, info_rpi):
+    """Imprime los datos en consola de forma organizada"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    print(f"\n┌──────────────────────────────────────────────────────────")
+    print(f"│ 📡 LECTURA: {timestamp}")
+    print(f"├──────────────────────────────────────────────────────────")
+    print(f"│ 🖥️  Dispositivo: {info_rpi['modelo_rpi']}")
+    if info_rpi.get('cpu_temp'):
+        print(f"│ 🌡️  CPU Temp: {info_rpi['cpu_temp']}°C")
+    print(f"├──────────────────────────────────────────────────────────")
+    print(f"│ 📊 DATOS CRUDOS (Lectura Directa del Sensor)")
+    print(f"│    🌡️  Temperatura: {datos_raw['temp']}°C")
+    print(f"│    💧 Humedad: {datos_raw['hum']}%")
+    print(f"│    💨 Gas: {datos_raw['gas']} ppm")
+    print(f"│    📏 Distancia: {datos_raw['distancia']} cm")
+    print(f"├──────────────────────────────────────────────────────────")
+    print(f"│ 🔄 DATOS PROCESADOS")
+    print(f"│    🌡️  Temperatura: {datos_filtrados['temp']}°C (Promedio 3)")
+    print(f"│    💧 Humedad: {datos_filtrados['hum']}% (Promedio 3)")
+    print(f"│    💨 Gas: {datos_filtrados['gas']} ppm (Promedio 3)")
+    print(f"│    📏 Distancia: {datos_filtrados['distancia']} cm (DIRECTO)")
+    print(f"└──────────────────────────────────────────────────────────")
+
+# ==========================================
+# 🚀 PROGRAMA PRINCIPAL
+# ==========================================
+def main():
+    imprimir_banner()
+    
+    # Inicializar componentes del sistema
+    info_rpi = obtener_info_raspberry()
+    print(f"\n📱 Dispositivo: {info_rpi['modelo_rpi']}")
+    print(f"🏠 Hostname: {info_rpi['hostname']}")
+    print(f"🐍 Python: {info_rpi['python_version']}")
+    
+    sensores = GestorSensores()
+    filtro = FiltroDatos()
+    
+    # Configurar cliente MQTT
+    print(f"\n🌐 Conectando a MQTT Broker...")
+    print(f"   Servidor: {BROKER}")
+    print(f"   Puerto: {PORT}")
+    print(f"   Topic: {TOPIC}")
+    
+    client_id = f"RaspberryPi_{info_rpi['hostname']}_{random.randint(1000,9999)}"
+    
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id)
     except:
         client = mqtt.Client(client_id)
-
+    
     client.username_pw_set(USER, PASS)
     client.tls_set(cert_reqs=ssl.CERT_NONE)
-    client.on_message = on_message
-
+    
+    def on_connect(client, userdata, flags, rc):
+        if rc == 0:
+            print("✅ Conectado exitosamente a HiveMQ Cloud")
+        else:
+            print(f"❌ Error de conexión. Código: {rc}")
+    
+    def on_disconnect(client, userdata, rc):
+        print("⚠️ Desconectado del broker MQTT")
+    
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    
     try:
         client.connect(BROKER, PORT)
-        client.subscribe(TOPIC)
         client.loop_start()
-    except:
-        pass
-
-    return client, memoria, detector_ia
-
-_, memoria, detector_ia = obtener_recursos()
-
-# ==========================================
-# 🔄 BUCLE PRINCIPAL
-# ==========================================
-while True:
-    data = memoria["ultimo_dato"]
-    ahora = time.time()
-    ultima_vez = memoria["ultima_recepcion"]
-    segundos_atras = ahora - ultima_vez
-
-    # === ONLINE ===
-    if data and segundos_atras < TIEMPO_LIMITE_DESCONEXION:
-        t = data.get('temp', 0)
-        h = data.get('hum', 0)
-        g = data.get('gas', 0)
-        hw = data.get('hardware', {})
-        sensores = data.get('estado_sensores', {})
-        filtro_info = data.get('filtro', {})
-        datos_raw = data.get('datos_raw', {})
-
-        # Predicción IA
-        prediccion = detector_ia.predecir(t, h, g)
-        
-        # Análisis de riesgo combinado
-        riesgo = analizar_riesgo_avanzado(t, g, h, prediccion)
-
-        # Estado conexión
-        estado_rpi.success(f"🟢 **ONLINE** | Última lectura: hace {int(segundos_atras)}s")
-        
-        # Info dispositivo
-        with info_dispositivo.container():
-            c1, c2, c3 = st.columns(3)
-            c1.markdown(f"**💻 Dispositivo:** {hw.get('modelo_rpi', 'N/A')}")
-            c2.markdown(f"**🌡️ CPU:** {hw.get('cpu_temp', 'N/A')}°C")
-            c3.markdown(f"**🐍 Python:** {hw.get('python_version', 'N/A')}")
-
-        # KPIs
-        kpi_temp.metric(
-            "🌡️ Temperatura",
-            f"{t} °C",
-            f"Raw: {datos_raw.get('temp', t)}°C",
-            delta_color="inverse" if t > 35 else "normal"
-        )
-        kpi_hum.metric(
-            "💧 Humedad",
-            f"{h} %",
-            f"Raw: {datos_raw.get('hum', h)}%"
-        )
-        kpi_gas.metric(
-            "💨 Calidad Aire",
-            f"{g} ppm",
-            f"Raw: {datos_raw.get('gas', g)} ppm",
-            delta_color="inverse" if g > 150 else "normal"
-        )
-        kpi_riesgo.metric(
-            "⚡ Riesgo",
-            f"{riesgo['score']}%",
-            riesgo['nivel'],
-            delta_color=riesgo['color']
-        )
-
-        # Alertas
-        if riesgo['nivel'] == "CRÍTICO":
-            alert_banner.error(f"## {riesgo['icono']} {riesgo['mensaje']}")
-        elif riesgo['nivel'] == "ADVERTENCIA":
-            alert_banner.warning(f"## {riesgo['icono']} {riesgo['mensaje']}")
-        else:
-            alert_banner.success(f"## {riesgo['icono']} {riesgo['mensaje']}")
-
-        # Estado IA
-        with ia_status.container():
-            st.markdown("**🤖 Análisis IA**")
-            if prediccion['estado'] == "ENTRENANDO":
-                st.info(prediccion['mensaje'])
-            elif prediccion['es_anomalia']:
-                st.error(f"⚠️ ANOMALÍA (conf: {prediccion['confianza']}%)")
+    except Exception as e:
+        print(f"❌ Error de red: {e}")
+        return
+    
+    print("\n" + "="*60)
+    print("🔄 INICIANDO MONITOREO CONTINUO")
+    print("   Presiona Ctrl+C para detener el sistema")
+    print("="*60)
+    
+    # Bucle principal de monitoreo
+    try:
+        while True:
+            # === 1. LECTURA DE SENSORES ===
+            temp_dht, hum_dht = sensores.leer_dht11()
+            gas_mq = sensores.leer_mq135()
+            temp_lm = sensores.leer_lm35()
+            distancia = sensores.leer_ultrasonido()  # Lectura directa sin filtro
+            
+            # Seleccionar fuente de temperatura (priorizar LM35 si está disponible)
+            temp_principal = temp_lm if USAR_LM35 and temp_lm else temp_dht
+            
+            # Validar datos nulos
+            if temp_principal is None:
+                temp_principal = 0
+            if hum_dht is None:
+                hum_dht = 0
+            
+            # === 2. PREPARAR DATOS CRUDOS ===
+            datos_raw = {
+                "temp": temp_principal,
+                "hum": hum_dht,
+                "gas": gas_mq,
+                "distancia": distancia
+            }
+            
+            # === 3. PRE-PROCESAMIENTO ===
+            # Aplica filtrado selectivo:
+            # - Temp/Hum/Gas: Promedio móvil (suavizado)
+            # - Distancia: Pasa directo (velocidad)
+            datos_filtrados = filtro.procesar(
+                temp_principal, hum_dht, gas_mq, distancia
+            )
+            
+            # === 4. ENVÍO DE DATOS ===
+            if datos_filtrados["temp"] is not None:
+                # Construir payload JSON completo
+                payload = {
+                    "sensor_id": "Pi_Bosque_01",
+                    
+                    # Datos procesados (valores estables + distancia instantánea)
+                    "temp": datos_filtrados["temp"],
+                    "hum": datos_filtrados["hum"] if datos_filtrados["hum"] else 0,
+                    "gas": datos_filtrados["gas"] if datos_filtrados["gas"] else 0,
+                    "distancia": datos_filtrados["distancia"] if datos_filtrados["distancia"] else 0,
+                    
+                    # Datos crudos para comparación y depuración
+                    "datos_raw": datos_raw,
+                    
+                    # Estado de conexión de sensores
+                    "estado_sensores": sensores.obtener_estado_sensores(),
+                    
+                    # Información del hardware
+                    "hardware": {
+                        **obtener_info_raspberry(),
+                        **sensores.obtener_modelos()
+                    },
+                    
+                    # Configuración del filtro
+                    "filtro": filtro.get_estado(),
+                    
+                    # Timestamp UNIX
+                    "timestamp": time.time()
+                }
+                
+                # Publicar en MQTT
+                client.publish(TOPIC, json.dumps(payload))
+                
+                # Mostrar en consola
+                imprimir_datos(datos_raw, datos_filtrados, info_rpi)
             else:
-                st.success(f"✅ Normal (conf: {prediccion['confianza']}%)")
+                print(f"⏳ [{datetime.now().strftime('%H:%M:%S')}] Esperando datos válidos del DHT11...")
+            
+            # Pausa entre lecturas (1.5 segundos para aprovechar respuesta rápida del ultrasonido)
+            time.sleep(1.5)
+            
+    except KeyboardInterrupt:
+        print("\n\n🛑 Señal de interrupción recibida. Deteniendo sistema...")
+    except Exception as e:
+        print(f"\n❌ Error inesperado: {e}")
+    finally:
+        print("\n🧹 Limpiando recursos...")
+        sensores.cleanup()
+        client.loop_stop()
+        client.disconnect()
+        print("👋 Sistema cerrado correctamente. ¡Hasta pronto!")
 
-        # Hardware info
-        with info_hardware.container():
-            st.markdown("**📟 Información del Sistema**")
-            st.markdown(f"- **Modelo:** {hw.get('modelo_rpi', 'N/A')}")
-            st.markdown(f"- **Host:** {hw.get('hostname', 'N/A')}")
-            st.markdown(f"- **Filtro:** Promedio de {filtro_info.get('ventana', 3)} muestras")
-
-        # Tabla de sensores
-        with tabla_sensores.container():
-            st.markdown("**📡 Estado de Sensores**")
-            df = pd.DataFrame({
-                "Sensor": ["DHT11", "MQ-135", "LM35"],
-                "Tipo": ["Temp/Hum", "Gas", "Temp Precisión"],
-                "Modelo": [
-                    hw.get('modelo_temp_hum', 'N/A'),
-                    hw.get('modelo_gas', 'N/A'),
-                    hw.get('modelo_temp_precision', 'N/A')
-                ],
-                "Estado": [
-                    sensores.get('dht11', 'N/A'),
-                    sensores.get('mq135', 'N/A'),
-                    sensores.get('lm35', 'N/A')
-                ]
-            })
-            st.dataframe(df, hide_index=True, use_container_width=True)
-
-        # Estadísticas IA
-        stats = detector_ia.get_estadisticas()
-        with stats_ia.container():
-            st.markdown("**📊 Estadísticas del Modelo**")
-            if stats:
-                st.markdown(f"- **Muestras:** {stats['muestras']}")
-                st.markdown(f"- **Temp media:** {stats['temp_media']}°C ±{stats['temp_std']}")
-                st.markdown(f"- **Hum media:** {stats['hum_media']}% ±{stats['hum_std']}")
-            else:
-                st.info("Recolectando datos...")
-
-        # Factores de riesgo
-        with factores_riesgo.container():
-            st.markdown("**🎯 Factores de Riesgo Detectados**")
-            if riesgo['factores']:
-                for f in riesgo['factores']:
-                    st.markdown(f"- {f}")
-            else:
-                st.markdown("- Ninguno detectado ✓")
-
-        # Gráfico historial
-        with grafico_historial.container():
-            if len(memoria["historial_temp"]) > 5:
-                df_hist = pd.DataFrame({
-                    "Temperatura": list(memoria["historial_temp"]),
-                    "Humedad": list(memoria["historial_hum"]),
-                    "Gas": list(memoria["historial_gas"])
-                })
-                st.line_chart(df_hist, height=200)
-
-    # === OFFLINE ===
-    elif data and segundos_atras >= TIEMPO_LIMITE_DESCONEXION:
-        estado_rpi.error(f"🔴 **OFFLINE** | Perdido hace {int(segundos_atras)}s")
-        info_dispositivo.warning("⚠️ Raspberry Pi no responde")
-        
-        kpi_temp.metric("🌡️ Temperatura", "--", "Sin señal")
-        kpi_hum.metric("💧 Humedad", "--", "Sin señal")
-        kpi_gas.metric("💨 Calidad Aire", "--", "Sin señal")
-        kpi_riesgo.metric("⚡ Riesgo", "--", "Sin datos")
-        
-        alert_banner.error("## 🔌 SISTEMA DESCONECTADO")
-        ia_status.warning("IA pausada")
-        
-        tabla_sensores.empty()
-        info_hardware.info("Esperando reconexión...")
-
-    # === ESPERANDO ===
-    else:
-        estado_rpi.info("⏳ Buscando dispositivo...")
-        alert_banner.info("⏳ Esperando primera conexión con Raspberry Pi...")
-
-    time.sleep(1)
+if __name__ == "__main__":
+    main()
