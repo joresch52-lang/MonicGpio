@@ -20,12 +20,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # ⚙️ CONFIGURACIÓN
 # ==========================================
-BROKER = "6071f9f543bb41f297470c8742588c93.s1.eu.hivemq.cloud"
-PORT = 8883
-USER = "jore746"
-PASS = "Wildbl00d$746"
-TOPIC = "bosque/sensores"
-TIEMPO_LIMITE_DESCONEXION = 6
+
 
 # ==========================================
 # 🤖 MODELO DE IA - DETECCIÓN DE ANOMALÍAS
@@ -510,3 +505,4 @@ while True:
         alert_banner.info("⏳ Esperando primera conexión con Raspberry Pi...")
 
     time.sleep(1)
+
